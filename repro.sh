@@ -36,7 +36,11 @@ suite="${REPRO_SUITE:-trixie}"
 mirror="${REPRO_MIRROR:-http://deb.debian.org/debian}"
 disk_size="${REPRO_DISK_SIZE:-3G}"
 image="${work}/disk.img"
-target_tar="${work}/target.tar"
+## Default mirrors the live ISO squashfs the Calamares target is unpacked from: grub-common,
+## grub-pc-bin and the grub-efi binaries are already installed there; grub-pc is not.
+target_include="${REPRO_INCLUDE:-grub-common,grub-pc-bin,grub-efi-amd64-bin,grub-efi-amd64-signed,linux-image-amd64}"
+## Cache keyed by the package list, so a changed list never reuses a stale bootstrap.
+target_tar="${work}/target-$(printf '%s' "${target_include}" | sha256sum | cut -c1-12).tar"
 mnt="${work}/mnt"
 keyfile="${work}/luks.key"
 mapper_name='grub-pc-seed-repro-root'
@@ -108,7 +112,7 @@ unbind_api() {
 ## base already (grub-probe comes from it); grub-pc is NOT.
 make_target_tar() {
    [ -s "${target_tar}" ] && return 0
-   mmdebstrap --variant=minbase --include=grub-common,linux-image-amd64 \
+   mmdebstrap --variant=minbase --include="${target_include}" \
       "${suite}" "${target_tar}" "${mirror}"
 }
 

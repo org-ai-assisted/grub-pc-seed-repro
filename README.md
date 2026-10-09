@@ -31,6 +31,17 @@ One `RESULT` line per scenario; full logs under `${REPRO_WORK:-/var/tmp/grub-pc-
     RESULT seed-root  seed='/dev/mapper/grub-pc-seed-repro-root'  apt_rc=0 status='install ok installed' reconfigure_rc=0
     RESULT seed-boot  seed='/dev/loop0'                           apt_rc=0 status='install ok installed' reconfigure_rc=0
 
+Default target packages (`REPRO_INCLUDE`) mirror the live ISO squashfs the Calamares
+target is unpacked from: `grub-common`, `grub-pc-bin`, `grub-efi-amd64-bin`,
+`grub-efi-amd64-signed` preinstalled, `grub-pc` not. With that live-like target the
+unseeded result is the same:
+
+    RESULT unseeded seed='' apt_rc=0 status='install ok installed' reconfigure_rc=0
+
+Live BIOS Calamares install (seeded from `grub-probe --target=disk /boot`, debug logs read
+off the installed disk): `/` -> LUKS mapper, `/boot` -> `/dev/sda`; grub-pc postinst
+"grub-install success for /dev/sda"; grub-pc `install ok installed`.
+
 Findings:
 
 - In a plain chroot, an UNSEEDED `apt-get install grub-pc` does NOT leave grub-pc
