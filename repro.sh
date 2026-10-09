@@ -98,13 +98,20 @@ bind_api() {
    for d in dev dev/pts proc sys; do
       mkdir --parents -- "${mnt}/${d}"
       mount --bind -- "/${d}" "${mnt}/${d}"
+      ## Slave: events never propagate back to the host (shared propagation is the
+      ## systemd default), so unmounting here cannot touch host mounts.
+      mount --make-rslave -- "${mnt}/${d}"
    done
 }
 
+## Fail loud: a bind left mounted would let reset_target recurse into the host's
+## /dev, /proc or /sys.
 unbind_api() {
    local d
    for d in dev/pts dev proc sys; do
-      umount --lazy -- "${mnt}/${d}" || true
+      if mountpoint --quiet -- "${mnt}/${d}"; then
+         umount -- "${mnt}/${d}"
+      fi
    done
 }
 
@@ -112,11 +119,31 @@ unbind_api() {
 ## base already (grub-probe comes from it); grub-pc is NOT.
 make_target_tar() {
    [ -s "${target_tar}" ] && return 0
+   ## Atomic: an interrupted bootstrap must never leave a tarball a later run reuses.
    mmdebstrap --variant=minbase --include="${target_include}" \
-      "${suite}" "${target_tar}" "${mirror}"
+      "${suite}" "${target_tar}.part.tar" "${mirror}"
+   mv -- "${target_tar}.part.tar" "${target_tar}"
+}
+
+## Mounts below the target root other than its /boot (literal prefix match, no regex).
+list_submounts() {
+   local target
+   while IFS= read -r target; do
+      case "${target}" in
+         "${mnt}/boot")
+            ;;
+         "${mnt}"/*)
+            printf '%s\n' "${target}"
+            ;;
+      esac
+   done < <(findmnt --list --noheadings --output TARGET)
 }
 
 reset_target() {
+   local submounts
+   ## Never delete while anything but /boot is mounted below the target root.
+   submounts="$(list_submounts)"
+   [ -z "${submounts}" ] || die "refusing to reset the target: still mounted below it: ${submounts}"
    find "${mnt}" -xdev -mindepth 1 -maxdepth 1 ! -name boot ! -name lost+found -exec safe-rm --recursive --force -- {} +
    find "${mnt}/boot" -xdev -mindepth 1 -maxdepth 1 ! -name lost+found -exec safe-rm --recursive --force -- {} +
    tar --extract --file="${target_tar}" --directory="${mnt}"
