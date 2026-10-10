@@ -21,7 +21,7 @@
 ##
 ## Usage (root, throwaway machine -- creates loop devices, LUKS, mounts):
 ##   ./repro.sh [scenario...]        default: all three
-## Output: one summary line per scenario + full logs under ${REPRO_WORK:-/var/tmp/grub-pc-seed-repro}.
+## Output: one summary line per scenario + full logs under ${REPRO_WORK:-/var/lib/grub-pc-seed-repro}.
 
 set -o errexit
 set -o nounset
@@ -31,7 +31,9 @@ shopt -s inherit_errexit
 shopt -s shift_verbose
 export LC_ALL=C
 
-work="${REPRO_WORK:-/var/tmp/grub-pc-seed-repro}"
+## Root-only by default: everything below is created, extracted and executed as root, so
+## the work dir must never be one a local user could pre-create (see secure_work_dir).
+work="${REPRO_WORK:-/var/lib/grub-pc-seed-repro}"
 suite="${REPRO_SUITE:-trixie}"
 mirror="${REPRO_MIRROR:-http://deb.debian.org/debian}"
 disk_size="${REPRO_DISK_SIZE:-3G}"
@@ -45,6 +47,9 @@ mnt="${work}/mnt"
 keyfile="${work}/luks.key"
 mapper_name='grub-pc-seed-repro-root'
 loopdev=''
+## Teardown undoes only what THIS run did.
+mapper_opened='false'
+mounted_list=()
 
 die() {
    printf '%s\n' "repro: FATAL: $*" >&2
@@ -53,15 +58,40 @@ die() {
 
 [ "$(id -u)" = 0 ] || die "must run as root"
 
+## Refuse a work dir a non-root user could control: it must be a real directory (no
+## symlink), owned by root, and not group/other-writable. Created 0700 if absent.
+secure_work_dir() {
+   local stat_out
+   if [ ! -e "${work}" ] && [ ! -L "${work}" ]; then
+      mkdir --mode=0700 -- "${work}"
+   fi
+   [ ! -L "${work}" ] || die "work dir '${work}' is a symlink"
+   [ -d "${work}" ] || die "work dir '${work}' is not a directory"
+   stat_out="$(stat --format='%u %a' -- "${work}")"
+   case "${stat_out}" in
+      "0 "?[0145][0145])
+         ;;
+      *)
+         die "work dir '${work}' must be root-owned and not group/other-writable (got uid/mode '${stat_out}')"
+         ;;
+   esac
+}
+
+## Record a mount this run made, so teardown unmounts only those (innermost first).
+mount_tracked() {
+   mount "$@"
+   mounted_list+=( "${!#}" )
+}
+
 teardown() {
-   local mp
-   for mp in "${mnt}/dev/pts" "${mnt}/dev" "${mnt}/proc" "${mnt}/sys" "${mnt}/boot" "${mnt}"; do
-      if mountpoint --quiet -- "${mp}" 2>/dev/null; then
-         umount --lazy -- "${mp}" || true
-      fi
+   local i
+   for (( i=${#mounted_list[@]}-1; i>=0; i-- )); do
+      umount --lazy -- "${mounted_list[${i}]}" || true
    done
-   if [ -e "/dev/mapper/${mapper_name}" ]; then
+   mounted_list=()
+   if [ "${mapper_opened}" = 'true' ]; then
       cryptsetup close "${mapper_name}" || true
+      mapper_opened='false'
    fi
    if [ -n "${loopdev}" ]; then
       losetup --detach "${loopdev}" || true
@@ -83,21 +113,22 @@ make_disk() {
    head --bytes=64 /dev/urandom > "${keyfile}"
    cryptsetup luksFormat --batch-mode --type luks2 --key-file "${keyfile}" -- "${loopdev}p2"
    cryptsetup open --key-file "${keyfile}" -- "${loopdev}p2" "${mapper_name}"
+   mapper_opened='true'
    mkfs.ext4 -q -F -- "/dev/mapper/${mapper_name}"
 }
 
 mount_target() {
    mkdir --parents -- "${mnt}"
-   mount -- "/dev/mapper/${mapper_name}" "${mnt}"
+   mount_tracked -- "/dev/mapper/${mapper_name}" "${mnt}"
    mkdir --parents -- "${mnt}/boot"
-   mount -- "${loopdev}p1" "${mnt}/boot"
+   mount_tracked -- "${loopdev}p1" "${mnt}/boot"
 }
 
 bind_api() {
    local d
    for d in dev dev/pts proc sys; do
       mkdir --parents -- "${mnt}/${d}"
-      mount --bind -- "/${d}" "${mnt}/${d}"
+      mount_tracked --bind -- "/${d}" "${mnt}/${d}"
       ## Slave: events never propagate back to the host (shared propagation is the
       ## systemd default), so unmounting here cannot touch host mounts.
       mount --make-rslave -- "${mnt}/${d}"
@@ -105,14 +136,31 @@ bind_api() {
 }
 
 ## Fail loud: a bind left mounted would let reset_target recurse into the host's
-## /dev, /proc or /sys.
+## /dev, /proc or /sys. Only unmounts the binds bind_api recorded.
 unbind_api() {
-   local d
+   local d i
+   local -a keep=()
    for d in dev/pts dev proc sys; do
-      if mountpoint --quiet -- "${mnt}/${d}"; then
-         umount -- "${mnt}/${d}"
-      fi
+      for i in "${!mounted_list[@]}"; do
+         if [ "${mounted_list[${i}]}" = "${mnt}/${d}" ]; then
+            umount -- "${mnt}/${d}"
+            unset 'mounted_list[i]'
+         fi
+      done
    done
+   keep=( "${mounted_list[@]}" )
+   mounted_list=( "${keep[@]}" )
+}
+
+## Scenario names become file names: allowlist them before any path is built.
+validate_scenario() {
+   case "$1" in
+      unseeded|seed-root|seed-boot)
+         ;;
+      *)
+         die "unknown scenario '$1' (allowed: unseeded seed-root seed-boot)"
+         ;;
+   esac
 }
 
 ## Bootstrapped once, restored per scenario. grub-common is in the Calamares target
@@ -158,6 +206,7 @@ in_target() {
 run_scenario() {
    local scenario log seed_from devices apt_rc status reconf_rc
    scenario="$1"
+   validate_scenario "${scenario}"
    log="${work}/${scenario}.log"
    true >| "${log}"
    reset_target
@@ -199,11 +248,14 @@ run_scenario() {
 main() {
    local -a scenarios=( "$@" )
    [ "${#scenarios[@]}" -gt 0 ] || scenarios=( unseeded seed-root seed-boot )
-   mkdir --parents -- "${work}"
+   local s
+   for s in "${scenarios[@]}"; do
+      validate_scenario "${s}"
+   done
+   secure_work_dir
    make_target_tar
    make_disk
    mount_target
-   local s
    for s in "${scenarios[@]}"; do
       run_scenario "${s}"
    done
