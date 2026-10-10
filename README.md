@@ -21,9 +21,9 @@ Scenarios: `unseeded`, `seed-root` (`grub-probe --target=disk /`), `seed-boot`
 
     ./repro.sh                 # all scenarios
     ./repro.sh seed-boot       # one scenario
-    REPRO_WORK=/var/tmp/x ./repro.sh
+    REPRO_WORK=/var/lib/x ./repro.sh   (root-owned, not group/other-writable)
 
-One `RESULT` line per scenario; full logs under `${REPRO_WORK:-/var/tmp/grub-pc-seed-repro}`.
+One `RESULT` line per scenario; full logs under `${REPRO_WORK:-/var/lib/grub-pc-seed-repro}`.
 
 ## Results (tested 2026-10-09, trixie, grub-pc 2.12-9+deb13u2, sandbox qube)
 
