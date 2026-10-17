@@ -229,6 +229,9 @@ run_scenario() {
    if [ -n "${seed_from}" ]; then
       devices="$(in_target grub-probe --target=disk "${seed_from}" 2>>"${log}" || true)"
       devices="${devices//$'\n'/, }"
+      ## debconf-set-selections ships in debconf (present in the minbase target as a
+      ## libpam-runtime dependency), NOT debconf-utils -- that ships debconf-get-selections,
+      ## a different tool. So no extra target_include entry is needed for this preseed.
       printf '%s\n' "grub-pc grub-pc/install_devices multiselect ${devices}" \
          | in_target debconf-set-selections
    fi
