@@ -31,6 +31,9 @@ shopt -s inherit_errexit
 shopt -s shift_verbose
 export LC_ALL=C
 
+## The root check, the EXIT trap and main() run only when executed, not when sourced (see
+## the guard at the bottom), so the unit tests can source this file and call its functions.
+
 ## Root-only by default: everything below is created, extracted and executed as root, so
 ## the work dir must never be one a local user could pre-create (see secure_work_dir).
 work="${REPRO_WORK:-/var/lib/grub-pc-seed-repro}"
@@ -41,8 +44,13 @@ image="${work}/disk.img"
 ## Default mirrors the live ISO squashfs the Calamares target is unpacked from: grub-common,
 ## grub-pc-bin and the grub-efi binaries are already installed there; grub-pc is not.
 target_include="${REPRO_INCLUDE:-grub-common,grub-pc-bin,grub-efi-amd64-bin,grub-efi-amd64-signed,linux-image-amd64}"
-## Cache keyed by the package list, so a changed list never reuses a stale bootstrap.
-target_tar="${work}/target-$(printf '%s' "${target_include}" | sha256sum | cut -c1-12).tar"
+## Cache keyed by suite + mirror + package list: changing ANY of them must never reuse a
+## bootstrap tarball built for a different suite/mirror/include set (NUL-separated so no two
+## distinct inputs can collide; the NULs survive the pipe, only the hex reaches $()).
+cache_key() {
+   printf '%s\0' "${suite}" "${mirror}" "${target_include}" | sha256sum | cut -c1-12
+}
+target_tar="${work}/target-$(cache_key).tar"
 mnt="${work}/mnt"
 keyfile="${work}/luks.key"
 mapper_name='grub-pc-seed-repro-root'
@@ -55,8 +63,6 @@ die() {
    printf '%s\n' "repro: FATAL: $*" >&2
    exit 1
 }
-
-[ "$(id -u)" = 0 ] || die "must run as root"
 
 ## Refuse a work dir a non-root user could control: it must be a real directory (no
 ## symlink), owned by root, and not group/other-writable. Created 0700 if absent.
@@ -98,7 +104,6 @@ teardown() {
       loopdev=''
    fi
 }
-trap teardown EXIT
 
 ## Calamares encrypted BIOS layout: msdos table, p1 = plain /boot, p2 = LUKS root.
 make_disk() {
@@ -167,7 +172,10 @@ validate_scenario() {
 ## base already (grub-probe comes from it); grub-pc is NOT.
 make_target_tar() {
    [ -s "${target_tar}" ] && return 0
-   ## Atomic: an interrupted bootstrap must never leave a tarball a later run reuses.
+   ## Atomic + self-healing: bootstrap to a .part file and rename on success, so an
+   ## interrupted run never leaves a tarball a later run reuses; drop any stale .part first,
+   ## since mmdebstrap refuses an existing target and would otherwise wedge every rerun.
+   safe-rm --force -- "${target_tar}.part.tar"
    mmdebstrap --variant=minbase --include="${target_include}" \
       "${suite}" "${target_tar}.part.tar" "${mirror}"
    mv -- "${target_tar}.part.tar" "${target_tar}"
@@ -203,6 +211,16 @@ in_target() {
    chroot "${mnt}" /usr/bin/env DEBIAN_FRONTEND=noninteractive TMPDIR=/tmp "$@"
 }
 
+## A seed scenario REQUIRES a real install device. A grub-probe failure OR empty result must
+## fail nonzero (never be reported as a valid 'seed=', which would corrupt the evidence).
+## Prints the comma-joined devices on stdout only on success.
+resolve_seed() {
+   local seed_from="$1" log="$2" out
+   out="$(in_target grub-probe --target=disk "${seed_from}" 2>>"${log}")" || return 1
+   [ -n "${out}" ] || return 1
+   printf '%s' "${out//$'\n'/, }"
+}
+
 run_scenario() {
    local scenario log seed_from devices apt_rc status reconf_rc
    scenario="$1"
@@ -227,8 +245,8 @@ run_scenario() {
    esac
    devices=''
    if [ -n "${seed_from}" ]; then
-      devices="$(in_target grub-probe --target=disk "${seed_from}" 2>>"${log}" || true)"
-      devices="${devices//$'\n'/, }"
+      devices="$(resolve_seed "${seed_from}" "${log}")" \
+         || die "grub-probe failed or resolved no device for scenario '${scenario}' seed_from='${seed_from}' (see ${log})"
       ## debconf-set-selections ships in debconf (present in the minbase target as a
       ## libpam-runtime dependency), NOT debconf-utils -- that ships debconf-get-selections,
       ## a different tool. So no extra target_include entry is needed for this preseed.
@@ -249,6 +267,8 @@ run_scenario() {
 }
 
 main() {
+   [ "$(id -u)" = 0 ] || die "must run as root"
+   trap teardown EXIT
    local -a scenarios=( "$@" )
    [ "${#scenarios[@]}" -gt 0 ] || scenarios=( unseeded seed-root seed-boot )
    local s
@@ -265,4 +285,7 @@ main() {
    printf '%s\n' "logs: ${work}/<scenario>.log"
 }
 
-main "$@"
+## Run only when executed, not when sourced by the unit tests.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+   main "$@"
+fi
